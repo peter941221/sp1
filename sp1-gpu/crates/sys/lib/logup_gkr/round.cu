@@ -5,6 +5,112 @@
 
 #include <cstdio>
 
+struct StoredCircuitValuesResult {
+    CircuitValues values;
+    size_t colIdx;
+    size_t outputStartIdx;
+    size_t restrictedIndex;
+};
+
+__device__ __forceinline__ StoredCircuitValuesResult fixLastVariableUncheckedAndStore(
+    const JaggedMle<JaggedGkrLayer> inputJaggedMle,
+    JaggedMle<JaggedGkrLayer> outputJaggedMle,
+    size_t i,
+    ext_t alpha) {
+
+    size_t colIdx = inputJaggedMle.colIndex[i];
+    size_t startIdx = inputJaggedMle.startIndices[colIdx];
+    size_t rowIdx = i - startIdx;
+
+    size_t zeroIdx = i << 1;
+    size_t oneIdx = zeroIdx + 1;
+    size_t outputStartIdx = outputJaggedMle.startIndices[colIdx];
+    size_t restrictedIndex = (outputStartIdx << 1) + rowIdx;
+
+    CircuitValues valuesZero =
+        CircuitValues::load(inputJaggedMle.denseData.layer, zeroIdx, inputJaggedMle.denseData.height);
+    CircuitValues valuesOne =
+        CircuitValues::load(inputJaggedMle.denseData.layer, oneIdx, inputJaggedMle.denseData.height);
+    CircuitValues values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+
+    values.store(outputJaggedMle.denseData.layer, restrictedIndex, outputJaggedMle.denseData.height);
+
+    return StoredCircuitValuesResult{values, colIdx, outputStartIdx, restrictedIndex};
+}
+
+__device__ __forceinline__ StoredCircuitValuesResult fixLastVariableTwoPaddingAndStore(
+    const JaggedMle<JaggedGkrLayer> inputJaggedMle,
+    JaggedMle<JaggedGkrLayer> outputJaggedMle,
+    size_t i,
+    ext_t alpha) {
+
+    size_t colIdx = inputJaggedMle.colIndex[i];
+    size_t startIdx = inputJaggedMle.startIndices[colIdx];
+    size_t interactionHeight = inputJaggedMle.startIndices[colIdx + 1] - startIdx;
+    size_t rowIdx = i - startIdx;
+
+    size_t zeroIdx = i << 1;
+    size_t oneIdx = zeroIdx + 1;
+    size_t outputStartIdx = outputJaggedMle.startIndices[colIdx];
+    size_t restrictedIndex = (outputStartIdx << 1) + rowIdx;
+
+    CircuitValues valuesZero =
+        CircuitValues::load(inputJaggedMle.denseData.layer, zeroIdx, inputJaggedMle.denseData.height);
+    CircuitValues valuesOne =
+        CircuitValues::load(inputJaggedMle.denseData.layer, oneIdx, inputJaggedMle.denseData.height);
+    CircuitValues values = CircuitValues::fix_last_variable(valuesZero, valuesOne, alpha);
+
+    values.store(outputJaggedMle.denseData.layer, restrictedIndex, outputJaggedMle.denseData.height);
+
+    size_t remainderModFour = interactionHeight & 3;
+    bool isLast = (interactionHeight - 1) == rowIdx;
+    if (remainderModFour && isLast) {
+        inputJaggedMle.denseData.pad(outputJaggedMle.denseData, restrictedIndex + 1);
+        inputJaggedMle.denseData.pad(outputJaggedMle.denseData, restrictedIndex + 2);
+        outputJaggedMle.colIndex[(restrictedIndex >> 1) + 1] = colIdx;
+    }
+
+    if (rowIdx & 1) {
+        outputJaggedMle.colIndex[restrictedIndex >> 1] = colIdx;
+    }
+
+    return StoredCircuitValuesResult{values, colIdx, outputStartIdx, restrictedIndex};
+}
+
+__device__ __forceinline__ SumAsPolyResult sumAsPolyCircuitLayerFromRestrictedPair(
+    const CircuitValues& valuesZero,
+    const CircuitValues& valuesOne,
+    size_t colIdx,
+    size_t outputStartIdx,
+    const ext_t* __restrict__ eqRow,
+    const ext_t* __restrict__ eqInteraction,
+    const ext_t lambda,
+    size_t outputIndex) {
+
+    size_t rowIdx = outputIndex - outputStartIdx;
+
+    size_t eqRowZeroIdx = rowIdx << 1;
+    size_t eqRowOneIdx = eqRowZeroIdx + 1;
+
+    ext_t eqInteractionValue = ext_t::load(eqInteraction, colIdx);
+    ext_t eqRowZeroValue = ext_t::load(eqRow, eqRowZeroIdx);
+    ext_t eqRowOneValue = ext_t::load(eqRow, eqRowOneIdx);
+
+    ext_t eqValueZero = eqRowZeroValue * eqInteractionValue;
+    ext_t eqValueOne = eqRowOneValue * eqInteractionValue;
+    ext_t eqValueHalf = eqValueZero + eqValueOne;
+
+    CircuitValues valuesHalf;
+    valuesHalf.numeratorZero = valuesZero.numeratorZero + valuesOne.numeratorZero;
+    valuesHalf.numeratorOne = valuesZero.numeratorOne + valuesOne.numeratorOne;
+    valuesHalf.denominatorZero = valuesZero.denominatorZero + valuesOne.denominatorZero;
+    valuesHalf.denominatorOne = valuesZero.denominatorOne + valuesOne.denominatorOne;
+
+    ext_t evalZero = valuesZero.sumAsPoly(lambda, eqValueZero);
+    ext_t evalHalf = valuesHalf.sumAsPoly(lambda, eqValueHalf);
+    return SumAsPolyResult{evalZero, evalHalf, eqValueHalf};
+}
+
 /// Currently not used.
 __global__ void fixLastVariableCircuitLayer(
     ext_t* __restrict__ layer,
@@ -258,30 +364,52 @@ __global__ void fixAndSumCircuitLayer(
         // Process one fixLastVariable. Since height is always even, this is guaranteed to not
         // require any padding checks.
         size_t firstIdx = i << 1;
-        inputJaggedMle.fixLastVariableUnchecked(outputJaggedMle, firstIdx, alpha);
+        StoredCircuitValuesResult firstResult =
+            fixLastVariableUncheckedAndStore(inputJaggedMle, outputJaggedMle, firstIdx, alpha);
 
         // The second fix_last_variable could by trying to process the end of the row. We are
         // guaranteed to be able to access the end of this row, but we need to make sure that the
         // next row has even length too.
         size_t secondIdx = firstIdx + 1;
 
-        size_t restrictedIndex =
-            inputJaggedMle.fixLastVariableTwoPadding(outputJaggedMle, secondIdx, alpha);
+        StoredCircuitValuesResult secondResult =
+            fixLastVariableTwoPaddingAndStore(inputJaggedMle, outputJaggedMle, secondIdx, alpha);
 
-        size_t outputIndex = restrictedIndex >> 1;
+        size_t outputIndex = secondResult.restrictedIndex >> 1;
 
-        // Now set up the sum_as_poly.
-        size_t colIdx = outputJaggedMle.colIndex[outputIndex];
-        size_t startIdx = outputJaggedMle.startIndices[colIdx];
-        SumAsPolyResult result = sumAsPolyCircuitLayerInner(
-            outputJaggedMle.denseData.layer,
-            colIdx,
-            startIdx,
-            eqRow,
-            eqInteraction,
-            lambda,
-            outputJaggedMle.denseData.height,
-            outputIndex);
+        bool canUseStoredPair = firstResult.colIdx == secondResult.colIdx &&
+                                firstResult.outputStartIdx == secondResult.outputStartIdx &&
+                                secondResult.restrictedIndex == firstResult.restrictedIndex + 1 &&
+                                (secondResult.restrictedIndex & 1);
+
+        SumAsPolyResult result;
+        if (canUseStoredPair) {
+            // Preserve output writes for downstream consumers, but use the freshly computed
+            // restricted pair directly when both values map to the same output pair.
+            result = sumAsPolyCircuitLayerFromRestrictedPair(
+                firstResult.values,
+                secondResult.values,
+                secondResult.colIdx,
+                secondResult.outputStartIdx,
+                eqRow,
+                eqInteraction,
+                lambda,
+                outputIndex);
+        } else {
+            // Fallback to the original global-memory path for any row-boundary or padding case
+            // where the two local restricted values do not form the same output pair.
+            size_t colIdx = outputJaggedMle.colIndex[outputIndex];
+            size_t startIdx = outputJaggedMle.startIndices[colIdx];
+            result = sumAsPolyCircuitLayerInner(
+                outputJaggedMle.denseData.layer,
+                colIdx,
+                startIdx,
+                eqRow,
+                eqInteraction,
+                lambda,
+                outputJaggedMle.denseData.height,
+                outputIndex);
+        }
 
         evalZero += result.evalZero;
         evalHalf += result.evalHalf;

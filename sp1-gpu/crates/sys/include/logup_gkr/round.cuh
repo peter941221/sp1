@@ -94,7 +94,7 @@ struct CircuitValues {
     }
 
     /// Compute the sumcheck sum values
-    __device__ __forceinline__ ext_t sumAsPoly(ext_t lambda, ext_t eqValue) {
+    __device__ __forceinline__ ext_t sumAsPoly(ext_t lambda, ext_t eqValue) const {
         ext_t numerator = numeratorZero * denominatorOne + numeratorOne * denominatorZero;
         ext_t denominator = denominatorZero * denominatorOne;
         return eqValue * (numerator * lambda + denominator);
